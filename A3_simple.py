@@ -22,7 +22,7 @@ class SortedDictManager(BaseManager):
 
 SortedDictManager.register('SortedDict', SortedDict)
 
-def create_action_collage(start_frame_path: str, middle_frame_path: str, end_frame_path: str, output_dir: str, action_index: int):
+def create_action_collage(start_frame_path: str, middle_frame_path: str, end_frame_path: str, collages_dir: str, action_index: int):
     """
     Creates and saves a horizontal collage of three frames showing the progression of an action.
     
@@ -30,11 +30,10 @@ def create_action_collage(start_frame_path: str, middle_frame_path: str, end_fra
         start_frame_path: Path to the starting frame.
         middle_frame_path: Path to the middle frame.
         end_frame_path: Path to the end frame.
-        output_dir: Directory where collages will be saved.
+        collages_dir: Directory where collages will be saved.
         action_index: Index of the action for clear identification.
     """
-    import os
-    os.makedirs(output_dir, exist_ok=True)  # Ensure the output directory exists
+    os.makedirs(collages_dir, exist_ok=True)
 
     try:
         # Open images
@@ -68,8 +67,12 @@ def create_action_collage(start_frame_path: str, middle_frame_path: str, end_fra
         positions = [0, total_width // 3, 2 * total_width // 3]
         
         for label, x_pos in zip(labels, positions):
-            # Position label centered above each frame
-            text_width, text_height = draw.textsize(label, font=font)
+            # Calculate text size
+            text_bbox = font.getbbox(label)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+            
+            # Position text
             x = x_pos + (total_width // 3 - text_width) // 2
             y = 10  # Position near the top
             
@@ -78,7 +81,7 @@ def create_action_collage(start_frame_path: str, middle_frame_path: str, end_fra
             draw.text((x, y), label, font=font, fill=(255, 255, 255))
         
         # Save the collage
-        output_path = os.path.join(output_dir, f"action_{action_index:02d}_progression_collage.jpg")
+        output_path = os.path.join(collages_dir, f"action_{action_index:02d}_progression_collage.jpg")
         collage.save(output_path, 'JPEG', quality=95, optimize=True, subsampling=0)
         print(f"Saved collage: {output_path}")
     
@@ -368,7 +371,7 @@ def process_scene_worker(
 
         # Hysteresis thresholds
         start_threshold = confidence_threshold
-        continue_threshold = confidence_threshold * 0.6 #intially it was 0.8
+        continue_threshold = confidence_threshold * 0.6 #intially it was 0.8,
 
         # Extend scene bounds slightly for buffer
         padding_frames = int(frames_per_window / 2)
@@ -465,7 +468,7 @@ def process_scene_worker(
                             confidence_history = []  # Reset confidence history
 
                 # Slide the window
-                frame_window = frame_window[6:]
+                frame_window = frame_window[5:]
 
             frame_counter += 1
 
@@ -496,14 +499,12 @@ def process_scene_worker(
 class ParallelActionRecognizer:
     def __init__(self,
                  model_path: str,
-                 variant: str,
                  resolution: Tuple[int, int] = (290, 290),
                  frames_per_window: int = 8,
                  confidence_threshold: float = 0.75,
                  num_processes: int = None):
         
         self.model_path = model_path
-        self.variant = variant,
         self.resolution = resolution
         self.frames_per_window = frames_per_window
         self.confidence_threshold = confidence_threshold
@@ -576,86 +577,68 @@ class ParallelActionRecognizer:
         with open(output_path, 'w') as f:
             json.dump(sorted_actions, f, indent=4)
     
-    def save_ontarget_frames(self, video_path: str, output_dir: str):
-        """
-        Saves high-resolution frames (start, middle, end) for all "ontarget" actions in individual folders.
 
-        Args:
-            video_path: Path to the original video file.
-            output_dir: Directory to save the folders for each action.
-        """
-        
-        os.makedirs(output_dir, exist_ok=True)
+def save_ontarget_frames_and_collages(actions_json_path: str, video_path: str, frames_dir: str, collages_dir: str):
+    """
+    Saves high-resolution frames and creates collages for all "ontarget" actions based on a JSON file.
 
-        # Open the video file
-        container = av.open(video_path)
-        stream = container.streams.video[0]
+    Args:
+        actions_json_path: Path to the JSON file with detected actions.
+        video_path: Path to the original video file.
+        frames_dir: Directory where high-resolution frames will be saved.
+        collages_dir: Directory where collages will be saved.
+    """
 
-        # Process "ontarget" actions
-        if 'ontarget' not in self.actions or not self.actions['ontarget']:
-            print("No 'ontarget' actions found.")
-            return
+    # Create output directories
+    os.makedirs(frames_dir, exist_ok=True)
+    os.makedirs(collages_dir, exist_ok=True)
 
-        for i, action in enumerate(self.actions['ontarget']):
+    # Load actions from JSON
+    with open(actions_json_path, 'r') as f:
+        actions = json.load(f)
+
+    # Process only "ontarget" actions
+    if 'ontarget' not in actions or not actions['ontarget']:
+        print("No 'ontarget' actions found in the JSON.")
+        return
+
+    # Open the video file
+    video = VideoFileClip(video_path)
+
+    for i, action in enumerate(actions['ontarget']):
+        try:
+            # Extract timestamps
             start_time = action['start_time']
             middle_time = action['middle_time']
             end_time = action['end_time']
 
-            # Create a folder for this action
-            action_folder = os.path.join(output_dir, f"ontarget_action_{i+1}")
-            os.makedirs(action_folder, exist_ok=True)
+            # Create a unique folder for this action's frames
+            action_frames_dir = os.path.join(frames_dir, f"ontarget_action_{i + 1}")
+            os.makedirs(action_frames_dir, exist_ok=True)
 
-            timestamps = {
-                "start": start_time,
-                "middle": middle_time,
-                "end": end_time
-            }
+            # Save frames at start, middle, and end timestamps
+            timestamps = {"start": start_time, "middle": middle_time, "end": end_time}
+            frame_paths = {}
 
             for key, timestamp in timestamps.items():
-                try:
-                    # Seek and decode the frame
-                    frame_pts = int(timestamp * stream.average_rate)
-                    container.seek(frame_pts, any_frame=True, backward=True)
+                frame_path = os.path.join(action_frames_dir, f"{key}.jpg")
+                frame = video.get_frame(timestamp)  # Get the frame as a numpy array
+                save_frame(frame, frame_path)
+                frame_paths[key] = frame_path
 
-                    for frame in container.decode(video=0):
-                        if frame.pts >= frame_pts:
-                            # Convert frame to numpy array and save
-                            frame_np = frame.to_ndarray(format="rgb24")
-                            save_frame(
-                                frame_np,
-                                os.path.join(action_folder, f"{key}.jpg")
-                            )
-                            break
-                except Exception as e:
-                    print(f"Failed to save {key} frame for action {i+1}: {e}")
+            # Create a collage for the action
+            if all(frame_paths.values()):
+                create_action_collage(
+                    frame_paths["start"],
+                    frame_paths["middle"],
+                    frame_paths["end"],
+                    collages_dir,
+                    i + 1,
+                )
+        except Exception as e:
+            print(f"Error processing 'ontarget' action {i + 1}: {e}")
 
-        container.close()
-    
-    def save_ontarget_collages(self, output_dir: str):
-        """
-        Creates and saves collages for all "ontarget" actions.
-
-        Args:
-            output_dir: Directory where collages will be saved.
-        """
-      
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Ensure "ontarget" actions exist
-        if 'ontarget' not in self.actions or not self.actions['ontarget']:
-            print("No 'ontarget' actions found.")
-            return
-
-        for i, action in enumerate(self.actions['ontarget']):
-            action_folder = os.path.join(output_dir, f"ontarget_action_{i+1}")
-            start_frame = os.path.join(action_folder, "start.jpg")
-            middle_frame = os.path.join(action_folder, "middle.jpg")
-            end_frame = os.path.join(action_folder, "end.jpg")
-
-            if os.path.exists(start_frame) and os.path.exists(middle_frame) and os.path.exists(end_frame):
-                create_action_collage(start_frame, middle_frame, end_frame, output_dir, i + 1)
-
-
+    video.close()
 
 def create_action_timeline(actions_json_path, output_path="Simple_A3_actions_timeline.png"):
     """
@@ -865,7 +848,6 @@ def main():
 
     recognizer = ParallelActionRecognizer(
         model_path="model_a3_operations_using_fp16_with_8_frames_at_single_batch_from_98.40%_model_at_training_split_75.0_25.0.tflite",
-        variant='A3',
         resolution=(256, 256),
         frames_per_window=8,
         confidence_threshold=0.85,
@@ -873,9 +855,8 @@ def main():
     )
 
     recognizer.process_video(video_path)
-    recognizer.save_ontarget_frames(video_path, output_dir)
     recognizer.save_actions(output_json)
-    recognizer.save_ontarget_collages(collages_dir)
+    save_ontarget_frames_and_collages(output_json, video_path, output_dir, collages_dir)
     create_action_timeline(output_json)
     create_ontarget_clips(output_json,video_path, 'Test Clips From  Simple A3', 'A3')
 
