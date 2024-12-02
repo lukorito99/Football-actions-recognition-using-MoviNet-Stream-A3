@@ -364,11 +364,11 @@ def process_scene_worker(
         confidence_history = []  # To track per-frame confidences for the current action
         original_confidence = None  # Store the original confidence when action starts
         decay_rate = 0.9  # Confidence decay rate
-        smoothed_prob_history_size = 5  # Temporal smoothing window intially it was 5
+        smoothed_prob_history_size = 3  # Temporal smoothing window intially it was 5
 
         # Hysteresis thresholds
         start_threshold = confidence_threshold
-        continue_threshold = confidence_threshold * 0.8 #intially it was 0.8, planning to do 0.6
+        continue_threshold = confidence_threshold * 0.6 #intially it was 0.8
 
         # Extend scene bounds slightly for buffer
         padding_frames = int(frames_per_window / 2)
