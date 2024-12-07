@@ -2,7 +2,7 @@ import av
 import cv2
 from matplotlib import patches
 import numpy as np
-from scenedetect import detect, ContentDetector
+
 from typing import Tuple, List, Dict
 import json
 from tqdm import tqdm
@@ -11,12 +11,12 @@ from sortedcontainers import SortedDict
 import multiprocessing as mp
 from multiprocessing.managers import BaseManager
 from functools import partial
-from skimage.metrics import structural_similarity as ssim
+
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw, ImageFont
 from matplotlib.gridspec import GridSpec
 import os
-
+from scenedetect import VideoManager, SceneManager, ContentDetector
 class SortedDictManager(BaseManager):
     pass
 
@@ -160,163 +160,6 @@ def save_frame(frame: np.ndarray, output_path: str, size: Tuple[int, int] = (192
 
 from multiprocessing import Pool, cpu_count
 
-def adaptive_scene_detect(video_path: str, initial_threshold: float = 27.0, workers: int = None) -> List[Tuple[int, int, str]]:
-    """
-    Adaptively detect scenes using PyAV for video processing, with multiprocessing to speed up replay handling.
-    
-    Args:
-        video_path: Path to the video file.
-        initial_threshold: Threshold for scene detection.
-        workers: Number of multiprocessing workers. Defaults to CPU count.
-
-    Returns:
-        List of tuples: (start_frame, end_frame, tag), where tag is 'original' or 'replay'.
-    """
-    def calculate_video_metrics(video_path: str, sample_duration: int = 10) -> Tuple[int, float, float]:
-        """Calculate video metrics using PyAV."""
-        container = av.open(video_path)
-        stream = container.streams.video[0]
-        
-        fps = float(stream.average_rate)
-        total_frames = stream.frames
-        frame_differences = []
-        
-        # Calculate sampling interval
-        sample_interval = max(1, int(total_frames / (fps * sample_duration)))
-        
-        prev_frame = None
-        for frame_idx, frame in enumerate(container.decode(video=0)):
-            if frame_idx % sample_interval == 0:
-                # Convert to grayscale numpy array
-                numpy_frame = frame.to_ndarray(format='gray')
-                
-                if prev_frame is not None:
-                    diff = np.abs(numpy_frame - prev_frame)
-                    frame_differences.append(np.mean(diff))
-                
-                prev_frame = numpy_frame
-        
-        container.close()
-        
-        if frame_differences:
-            mean_diff = np.mean(frame_differences)
-            std_diff = np.std(frame_differences)
-            
-            # Calculate content variation
-            content_variation = std_diff / mean_diff if mean_diff > 0 else 1
-            min_scene_frames = int(max(fps * 1.5, min(fps * 5, fps * (3 / content_variation))))
-            
-            # Adjust threshold based on content variation
-            threshold = initial_threshold * (1 + content_variation * 0.5)
-            
-            return min_scene_frames, threshold, fps
-            
-        return int(fps * 2), initial_threshold, fps
-
-    def calculate_similarity(frame1: np.ndarray, frame2: np.ndarray) -> float:
-        """Calculate similarity between two frames using SSIM."""
-        frame1_gray = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-        frame2_gray = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
-        return ssim(frame1_gray, frame2_gray)
-
-    def process_scene_replay(args) -> Tuple[int, int, str]:
-        """Worker function for replay detection."""
-        video_path, start1, end1, start2, end2 = args
-        container = av.open(video_path)
-        
-        # Extract middle frames of both scenes
-        mid1 = (start1 + end1) // 2
-        mid2 = (start2 + end2) // 2
-
-        container.seek(mid1)
-        frame1 = None
-        for frame in container.decode(video=0):
-            if frame.pts >= mid1:
-                frame1 = frame.to_ndarray(format="bgr24")
-                break
-
-        container.seek(mid2)
-        frame2 = None
-        for frame in container.decode(video=0):
-            if frame.pts >= mid2:
-                frame2 = frame.to_ndarray(format="bgr24")
-                break
-
-        container.close()
-
-        if frame1 is not None and frame2 is not None:
-            similarity = calculate_similarity(frame1, frame2)
-            if similarity > 0.85:  # Replay similarity threshold
-                return (start2, end2, "replay")
-
-        return (start2, end2, "original")
-
-    try:
-        # Step 1: Calculate adaptive parameters
-        min_scene_frames, threshold, fps = calculate_video_metrics(video_path)
-        print(f"Adaptive parameters: min_scene_frames={min_scene_frames}, threshold={threshold:.1f}")
-        
-        # Step 2: Detect initial scenes using PySceneDetect
-        scenes = detect(video_path, ContentDetector(
-            threshold=threshold,
-            min_scene_len=min_scene_frames / fps
-        ))
-        
-        # Convert to frame numbers
-        frame_scenes = [(int(scene[0].get_frames()), int(scene[1].get_frames())) for scene in scenes]
-
-        # Retry with lower threshold if too few scenes
-        if len(frame_scenes) < 2:
-            scenes = detect(video_path, ContentDetector(
-                threshold=threshold * 0.7,
-                min_scene_len=min_scene_frames / fps
-            ))
-            frame_scenes = [(int(scene[0].get_frames()), int(scene[1].get_frames())) for scene in scenes]
-
-        # Step 3: Merge small scenes
-        merged_scenes = []
-        current_start, current_end = frame_scenes[0]
-
-        for start, end in frame_scenes[1:]:
-            if start - current_end < min_scene_frames / 2:
-                current_end = end
-            else:
-                merged_scenes.append((current_start, current_end))
-                current_start, current_end = start, end
-
-        merged_scenes.append((current_start, current_end))
-
-        # Step 4: Multiprocessing for replay detection
-        replay_args = [
-            (video_path, merged_scenes[i][0], merged_scenes[i][1], merged_scenes[j][0], merged_scenes[j][1])
-            for i in range(len(merged_scenes) - 1)
-            for j in range(i + 1, len(merged_scenes))
-        ]
-
-        with Pool(workers or cpu_count()) as pool:
-            replay_results = pool.map(process_scene_replay, replay_args)
-
-        # Combine results
-        tagged_scenes = []
-        for i, (start, end) in enumerate(merged_scenes[:-1]):
-            tagged_scenes.append((start, end, "original"))
-            for result in replay_results:
-                if result[0] == merged_scenes[i + 1][0] and result[2] == "replay":
-                    tagged_scenes.append((result[0], result[1], "replay"))
-                    break
-
-        # Ensure the last scene is tagged as "original"
-        last_scene = merged_scenes[-1]
-        tagged_scenes.append((last_scene[0], last_scene[1], "original"))
-
-        return tagged_scenes
-
-    except Exception as e:
-        print(f"Adaptive scene detection failed: {e}")
-        container = av.open(video_path)
-        total_frames = container.streams.video[0].frames
-        container.close()
-        return [(0, total_frames, "original")]
 
 
 def process_scene_worker(
@@ -357,13 +200,19 @@ def process_scene_worker(
         states = init_states
 
         # Scene parameters
-        scene_start, scene_end, scene_tag = scene_info  # `scene_tag` is "original" or "replay"
+        scene_start, scene_end = scene_info 
+        scene_length = scene_end - scene_start
+
+        # Compute dynamic stride
+        stride = max(scene_length // 50, 5)
+        print(f'Current stride: {stride}, scene length: {scene_length}')
         scene_actions = {}
         frame_window = []
         prob_history = []
         current_action = None
         action_start_time = None
-        action_frames = {}
+       
+        
         confidence_history = []  # To track per-frame confidences for the current action
         original_confidence = None  # Store the original confidence when action starts
         decay_rate = 0.9  # Confidence decay rate
@@ -434,7 +283,7 @@ def process_scene_worker(
                             'confidence': max_prob,
                             'original_confidence': original_confidence,  # Include the original confidence
                             'confidence_history': confidence_history,
-                            'source': scene_tag  # "original" or "replay"
+                            
                         }
                        
                         
@@ -444,7 +293,7 @@ def process_scene_worker(
                         action_start_time = current_time
                         original_confidence = max_prob  # Record the new original confidence
                         confidence_history = [max_prob]
-                        action_frames = {'start': frame_np.copy()} if detected_action == 'ontarget' else {}
+                       
 
                     elif max_prob >= continue_threshold:
                         # Continue current action
@@ -462,13 +311,13 @@ def process_scene_worker(
                                 'confidence': max_prob,
                                 'original_confidence': original_confidence,  # Include the original confidence
                                 'confidence_history': confidence_history,
-                                'source': scene_tag  # "original" or "replay"
+                               
                             }
                             current_action = None
                             confidence_history = []  # Reset confidence history
 
                 # Slide the window
-                frame_window = frame_window[5:]
+                frame_window = frame_window[stride:]
 
             frame_counter += 1
 
@@ -482,7 +331,7 @@ def process_scene_worker(
                 'confidence': max_prob,
                 'original_confidence': original_confidence,  # Include the original confidence
                 'confidence_history': confidence_history,
-                'source': scene_tag  # "original" or "replay"
+                
             }
 
         container.close()
@@ -493,8 +342,33 @@ def process_scene_worker(
         if 'container' in locals():
             container.close()
         return {}
+    
+def detect_scenes(video_path: str) -> List[Tuple[int, int]]:
+    """
+    Detect scenes in a video using PySceneDetect with default content detection.
+    
+    Args:
+        video_path (str): Path to the input video file.
 
+    Returns:
+        List of scene frame ranges.
+    """
+    video_manager = VideoManager([video_path])
+    scene_manager = SceneManager()
+    scene_manager.add_detector(ContentDetector())
 
+    try:
+        video_manager.start()
+        scene_manager.detect_scenes(video_manager)
+        scene_list = scene_manager.get_scene_list()
+
+        return [
+            (scene[0].get_frames(), scene[1].get_frames())  
+            for scene in scene_list
+        ]
+
+    finally:
+        video_manager.release()
 
 class ParallelActionRecognizer:
     def __init__(self,
@@ -517,13 +391,11 @@ class ParallelActionRecognizer:
         self.dict_manager.start()
         self.actions = self.dict_manager.SortedDict()
 
-    def detect_scenes(self, video_path: str) -> List[tuple]:
-        """Detect scenes using adaptive scene detection."""
-        return adaptive_scene_detect(video_path)
+    
 
     def process_video(self, video_path: str):
         """Process the video with parallel scene processing."""
-        scenes = self.detect_scenes(video_path)
+        scenes = detect_scenes(video_path)
         print(f"Detected {len(scenes)} scenes")
 
         # Initialize actions dictionary by type
@@ -842,9 +714,9 @@ def create_ontarget_clips(actions_json_path: str, video_path: str, output_dir: s
 def main():
 
     video_path = "A point apiece ⚖️ ｜ HIGHLIGHTS ｜ Arsenal v Brighton & Hove Albion (1-1) ｜ Havertz ｜ Premier league [0dV0RrYuE14].mp4"
-    output_json = "Simple_A3_detected_actions_parallel.json"
-    output_dir = "Ontarget Actions Frames"
-    collages_dir = "Simple A3 Ontarget Actions Collages"
+    output_json = "Alternative_A3_detected_actions_parallel.json"
+    output_dir = "Alternative Ontarget Actions Frames"
+    collages_dir = "Alternative A3 Ontarget Actions Collages"
 
     recognizer = ParallelActionRecognizer(
         model_path="model_a3_operations_using_fp16_with_8_frames_at_single_batch_from_98.40%_model_at_training_split_75.0_25.0.tflite",
@@ -858,7 +730,7 @@ def main():
     recognizer.save_actions(output_json)
     save_ontarget_frames_and_collages(output_json, video_path, output_dir, collages_dir)
     create_action_timeline(output_json)
-    create_ontarget_clips(output_json,video_path, 'Test Clips From  Simple A3', 'A3')
+    create_ontarget_clips(output_json,video_path, 'Test Clips From Alternative A3', 'A3')
 
 
 if __name__ == "__main__":
