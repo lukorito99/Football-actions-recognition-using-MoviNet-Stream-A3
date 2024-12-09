@@ -3,20 +3,18 @@ import cv2
 from matplotlib import patches
 import numpy as np
 
-from typing import Tuple, List, Dict
+from typing import Tuple
 import json
-from tqdm import tqdm
 import tensorflow as tf
 from sortedcontainers import SortedDict
-import multiprocessing as mp
 from multiprocessing.managers import BaseManager
-from functools import partial
 
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw, ImageFont
 from matplotlib.gridspec import GridSpec
 import os
-from scenedetect import VideoManager, SceneManager, ContentDetector
+from fractions import Fraction
+
 class SortedDictManager(BaseManager):
     pass
 
@@ -158,37 +156,41 @@ def save_frame(frame: np.ndarray, output_path: str, size: Tuple[int, int] = (192
 
 
 
-from multiprocessing import Pool, cpu_count
+from multiprocessing import cpu_count
 
 
+class ParallelActionRecognizer:
+    def __init__(self,
+                 model_path: str,
+                 resolution: Tuple[int, int] = (256, 256),
+                 frames_per_window: int = 8,
+                 confidence_threshold: float = 0.85,
+                 num_processes: int = None):
+        """
+        Initialize the action recognizer.
+        """
+        self.model_path = model_path
+        self.resolution = resolution
+        self.frames_per_window = frames_per_window
+        self.confidence_threshold = confidence_threshold
+        self.num_processes = num_processes or max(1, cpu_count() - 1)
 
-def process_scene_worker(
-    model_path: str,
-    video_path: str,
-    scene_info: Tuple[int, int, str],
-    resolution: Tuple[int, int],
-    frames_per_window: int,
-    confidence_threshold: float,
-    classes: List[str]
-) -> Dict:
-    """
-    Enhanced scene worker with original confidence recording.
-    
-    Args:
-        model_path: Path to the TFLite model.
-        video_path: Path to the video file.
-        scene_info: Tuple (start_frame, end_frame, tag) with scene details.
-        resolution: Tuple (width, height) for resizing input frames.
-        frames_per_window: Number of frames per inference window.
-        confidence_threshold: Confidence threshold for action detection.
-        classes: List of action class names.
+        self.classes = ['shortpass', 'longpass', 'throw', 'goalkick',
+                        'penalty', 'corner', 'freekick', 'ontarget']
 
-    Returns:
-        Dictionary of detected actions with original confidence recorded.
-    """
-    try:
-        # Initialize TensorFlow Lite interpreter
-        interpreter = tf.lite.Interpreter(model_path=model_path, num_threads=None)
+        self.actions = {action: [] for action in self.classes}
+  
+    def process_video(self, video_path: str):
+        """
+        Process the video for action detection.
+        """
+        container = av.open(video_path)
+        stream = container.streams.video[0]
+        
+        total_frames = stream.frames
+
+              
+        interpreter = tf.lite.Interpreter(model_path=self.model_path, num_threads=self.num_processes)
         interpreter.allocate_tensors()
         runner = interpreter.get_signature_runner()
 
@@ -199,48 +201,29 @@ def process_scene_worker(
         }
         states = init_states
 
-        # Scene parameters
-        scene_start, scene_end = scene_info 
-        scene_length = scene_end - scene_start
-
-        # Compute dynamic stride
-        stride = max(scene_length // 50, 5)
-        print(f'Current stride: {stride}, scene length: {scene_length}')
-        scene_actions = {}
+        frame_counter = 0
         frame_window = []
         prob_history = []
         current_action = None
         action_start_time = None
-       
-        
-        confidence_history = []  # To track per-frame confidences for the current action
-        original_confidence = None  # Store the original confidence when action starts
-        decay_rate = 0.9  # Confidence decay rate
-        smoothed_prob_history_size = 3  # Temporal smoothing window intially it was 5
+        confidence_history = []
+        original_confidence = None
 
-        # Hysteresis thresholds
-        start_threshold = confidence_threshold
-        continue_threshold = confidence_threshold * 0.6 #intially it was 0.8,
-
-        # Extend scene bounds slightly for buffer
-        padding_frames = int(frames_per_window / 2)
-        adjusted_scene_end = min(scene_end + padding_frames, scene_end)
-
-        # Open video container
-        container = av.open(video_path)
-        stream = container.streams.video[0]
-        frame_counter = scene_start
+        decay_rate = 0.9
+        smoothed_prob_history_size = 4
+        start_threshold = self.confidence_threshold
+        continue_threshold = self.confidence_threshold * 0.6
 
         for frame in container.decode(video=0):
-            if frame_counter >= adjusted_scene_end:
+            if frame_counter > total_frames:
                 break
 
             # Prepare frame for processing
             frame_np = frame.to_ndarray(format='rgb24')
-            frame_resized = cv2.resize(frame_np, resolution)
+            frame_resized = cv2.resize(frame_np, self.resolution)
             frame_window.append(frame_resized)
 
-            if len(frame_window) == frames_per_window:
+            if len(frame_window) == self.frames_per_window:
                 # Model inference
                 processed_window = np.stack([f.astype(np.float32) / 255.0 for f in frame_window])
                 outputs = runner(**states, image=processed_window)
@@ -256,9 +239,9 @@ def process_scene_worker(
                 # Get max probability and detected action
                 max_prob = np.max(smoothed_probs)
                 action_id = np.argmax(smoothed_probs)
-                detected_action = classes[action_id]
-                current_time = float(frame.pts * stream.time_base)
-
+                detected_action = self.classes[action_id]
+               
+                current_time = frame.pts * stream.time_base
                 # Track confidence for the current frame
                 if current_action is not None:
                     confidence_history.append(max_prob)
@@ -269,31 +252,27 @@ def process_scene_worker(
                     current_action = detected_action
                     action_start_time = current_time
                     original_confidence = max_prob  # Record the original confidence
-                    confidence_history = [max_prob]  # Initialize confidence history
-                  
-
+                    confidence_history = [max_prob]
                 elif current_action is not None:
                     if detected_action != current_action and max_prob >= start_threshold:
                         # End current action and start a new one
-                        scene_actions[action_start_time] = {
+                        if current_action not in self.actions:
+                            self.actions[current_action] = []
+                        self.actions[current_action].append({
                             'action': current_action,
                             'start_time': action_start_time,
                             'middle_time': (action_start_time + current_time) / 2,
-                            'end_time': current_time + 1.0,  # Add buffer for completeness
+                            'end_time': current_time + 2.0,  # Add buffer for completeness
                             'confidence': max_prob,
                             'original_confidence': original_confidence,  # Include the original confidence
                             'confidence_history': confidence_history,
-                            
-                        }
-                       
-                        
+                        })
 
                         # Start new action
                         current_action = detected_action
                         action_start_time = current_time
                         original_confidence = max_prob  # Record the new original confidence
                         confidence_history = [max_prob]
-                       
 
                     elif max_prob >= continue_threshold:
                         # Continue current action
@@ -303,139 +282,51 @@ def process_scene_worker(
                         # Decay confidence and end action if below continue threshold
                         max_prob *= decay_rate
                         if max_prob < continue_threshold:
-                            scene_actions[action_start_time] = {
+                            self.actions[current_action].append({
                                 'action': current_action,
                                 'start_time': action_start_time,
                                 'middle_time': (action_start_time + current_time) / 2,
-                                'end_time': current_time + 1.0,  # Add buffer
+                                'end_time': current_time + 2.0,  # Add buffer
                                 'confidence': max_prob,
                                 'original_confidence': original_confidence,  # Include the original confidence
                                 'confidence_history': confidence_history,
-                               
-                            }
+                            })
                             current_action = None
-                            confidence_history = []  # Reset confidence history
+                            confidence_history = []
 
                 # Slide the window
-                frame_window = frame_window[stride:]
+                frame_window = frame_window[3:]
 
             frame_counter += 1
 
         # Handle last ongoing action
         if current_action is not None:
-            scene_actions[action_start_time] = {
+            self.actions[current_action].append({
                 'action': current_action,
                 'start_time': action_start_time,
                 'middle_time': (action_start_time + current_time) / 2,
-                'end_time': current_time + 1.0,
+                'end_time': current_time + 2.0,
                 'confidence': max_prob,
-                'original_confidence': original_confidence,  # Include the original confidence
+                'original_confidence': original_confidence,
                 'confidence_history': confidence_history,
-                
-            }
+            })
 
         container.close()
-        return scene_actions
-
-    except Exception as e:
-        print(f"Error processing scene {scene_info}: {e}")
-        if 'container' in locals():
-            container.close()
-        return {}
-    
-def detect_scenes(video_path: str) -> List[Tuple[int, int]]:
-    """
-    Detect scenes in a video using PySceneDetect with default content detection.
-    
-    Args:
-        video_path (str): Path to the input video file.
-
-    Returns:
-        List of scene frame ranges.
-    """
-    video_manager = VideoManager([video_path])
-    scene_manager = SceneManager()
-    scene_manager.add_detector(ContentDetector())
-
-    try:
-        video_manager.start()
-        scene_manager.detect_scenes(video_manager)
-        scene_list = scene_manager.get_scene_list()
-
-        return [
-            (scene[0].get_frames(), scene[1].get_frames())  
-            for scene in scene_list
-        ]
-
-    finally:
-        video_manager.release()
-
-class ParallelActionRecognizer:
-    def __init__(self,
-                 model_path: str,
-                 resolution: Tuple[int, int] = (290, 290),
-                 frames_per_window: int = 8,
-                 confidence_threshold: float = 0.75,
-                 num_processes: int = None):
-        
-        self.model_path = model_path
-        self.resolution = resolution
-        self.frames_per_window = frames_per_window
-        self.confidence_threshold = confidence_threshold
-        self.num_processes = num_processes or max(1, mp.cpu_count() - 1)
-
-        self.classes = ['shortpass', 'longpass', 'throw', 'goalkick',
-                       'penalty', 'corner', 'freekick', 'ontarget']
-
-        self.dict_manager = SortedDictManager()
-        self.dict_manager.start()
-        self.actions = self.dict_manager.SortedDict()
-
-    
-
-    def process_video(self, video_path: str):
-        """Process the video with parallel scene processing."""
-        scenes = detect_scenes(video_path)
-        print(f"Detected {len(scenes)} scenes")
-
-        # Initialize actions dictionary by type
-        self.actions = {action_type: [] for action_type in self.classes}
-
-        with mp.Pool(processes=self.num_processes) as pool:
-            process_scene_partial = partial(
-                process_scene_worker,
-                self.model_path,
-                video_path,
-                resolution=self.resolution,
-                frames_per_window=self.frames_per_window,
-                confidence_threshold=self.confidence_threshold,
-                classes=self.classes
-            )
-
-            results = []
-            for scene_actions in tqdm(
-                pool.imap_unordered(process_scene_partial, scenes),
-                total=len(scenes),
-                desc="Processing scenes"
-            ):
-                # Group actions by type
-                for _, action_data in scene_actions.items():
-                    action_type = action_data['action']
-                    if action_type in self.actions:
-                        self.actions[action_type].append(action_data)
-
+   
     def save_actions(self, output_path: str):
         """Save detected actions to JSON."""
         # Convert all float32 values in the actions dictionary to native Python float
         def convert_to_float32(o):
             if isinstance(o, np.float32):
                 return float(o)  # Convert np.float32 to Python float
+            elif isinstance(o, Fraction):
+                return float(o)  # Convert Fraction to float
             elif isinstance(o, dict):
-                return {k: convert_to_float32(v) for k, v in o.items()}
+                return {k: convert_to_float32(v) for k, v in o.items()}  # Recurse into dictionaries
             elif isinstance(o, list):
-                return [convert_to_float32(i) for i in o]
+                return [convert_to_float32(i) for i in o]  # Recurse into lists
             else:
-                return o
+                return o  # Return as-is for serializable types
 
         # Sort actions by start time within each action type
         sorted_actions = {}
@@ -448,6 +339,7 @@ class ParallelActionRecognizer:
         # Write to JSON file
         with open(output_path, 'w') as f:
             json.dump(sorted_actions, f, indent=4)
+
     
 
 def save_ontarget_frames_and_collages(actions_json_path: str, video_path: str, frames_dir: str, collages_dir: str):
@@ -512,10 +404,11 @@ def save_ontarget_frames_and_collages(actions_json_path: str, video_path: str, f
 
     video.close()
 
-def create_action_timeline(actions_json_path, output_path="Simple_A3_actions_timeline.png"):
+def create_action_timeline(actions_json_path, output_path="Monday_Tests_A3_actions_timeline.png"):
     """
     Create a detailed timeline visualization of soccer events with better layout 
-    and colorblind-friendly palette.
+    and colorblind-friendly palette. The timeline includes annotations at 
+    regular time intervals to help the viewer quickly identify the time points.
     
     Args:
         actions_json_path: Path to the JSON file containing detected actions in format:
@@ -604,8 +497,13 @@ def create_action_timeline(actions_json_path, output_path="Simple_A3_actions_tim
         return f"{minutes:02d}:{seconds:02d}"
     
     ax1.xaxis.set_major_formatter(plt.FuncFormatter(format_time))
-    ax1.xaxis.set_major_locator(plt.MultipleLocator(30))  # Major ticks every 30 seconds
-    ax1.xaxis.set_minor_locator(plt.MultipleLocator(10))  # Minor ticks every 10 seconds
+    ax1.xaxis.set_major_locator(plt.MultipleLocator(60))  # Major ticks every 60 seconds (1 minute)
+    ax1.xaxis.set_minor_locator(plt.MultipleLocator(30))  # Minor ticks every 30 seconds
+    
+    # Add timestamp annotations
+    for t in range(0, int(video_duration), 60):  # Add annotations every 60 seconds
+        ax1.axvline(t, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+        ax1.text(t, -0.25, format_time(t, None), ha='center', va='top', fontsize=10)
     
     # Rotate x-axis labels for better readability
     plt.setp(ax1.get_xticklabels(), rotation=45, ha='right')
@@ -637,8 +535,8 @@ def create_action_timeline(actions_json_path, output_path="Simple_A3_actions_tim
     
     # Apply same x-axis formatting
     ax2.xaxis.set_major_formatter(plt.FuncFormatter(format_time))
-    ax2.xaxis.set_major_locator(plt.MultipleLocator(30))
-    ax2.xaxis.set_minor_locator(plt.MultipleLocator(10))
+    ax2.xaxis.set_major_locator(plt.MultipleLocator(60))
+    ax2.xaxis.set_minor_locator(plt.MultipleLocator(30))
     plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
     
     # Customize bottom subplot
@@ -660,7 +558,6 @@ def create_action_timeline(actions_json_path, output_path="Simple_A3_actions_tim
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
     plt.close()
-
 
 from moviepy.editor import VideoFileClip
 
@@ -714,9 +611,9 @@ def create_ontarget_clips(actions_json_path: str, video_path: str, output_dir: s
 def main():
 
     video_path = "A point apiece ⚖️ ｜ HIGHLIGHTS ｜ Arsenal v Brighton & Hove Albion (1-1) ｜ Havertz ｜ Premier league [0dV0RrYuE14].mp4"
-    output_json = "Alternative_A3_detected_actions_parallel.json"
-    output_dir = "Alternative Ontarget Actions Frames"
-    collages_dir = "Alternative A3 Ontarget Actions Collages"
+    output_json = "Monday A3_detected_actions_parallel.json"
+    output_dir = "Monday Ontarget Actions Frames"
+    collages_dir = "Monday A3 Ontarget Actions Collages"
 
     recognizer = ParallelActionRecognizer(
         model_path="model_a3_operations_using_fp16_with_8_frames_at_single_batch_from_98.40%_model_at_training_split_75.0_25.0.tflite",
@@ -730,7 +627,7 @@ def main():
     recognizer.save_actions(output_json)
     save_ontarget_frames_and_collages(output_json, video_path, output_dir, collages_dir)
     create_action_timeline(output_json)
-    create_ontarget_clips(output_json,video_path, 'Test Clips From Alternative A3', 'A3')
+    create_ontarget_clips(output_json,video_path, 'Test Clips From Monday Tests Using A3', 'A3')
 
 
 if __name__ == "__main__":
