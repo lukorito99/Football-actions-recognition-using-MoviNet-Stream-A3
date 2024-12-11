@@ -276,7 +276,7 @@ class ParallelActionRecognizer:
                  batch_size: int = 1,
                  num_processes: int = None,
                  decay_rate: float = 0.3,
-                 smoothed_prob_history_size: int = 5):
+                 smoothed_prob_history_size: int = 3):
         self.model_path = model_path
         self.resolution = resolution
         self.batch_size = batch_size
