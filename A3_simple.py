@@ -158,8 +158,7 @@ def save_frame(frame: np.ndarray, output_path: str, size: Tuple[int, int] = (192
 
 from multiprocessing import cpu_count
 
-
-class ParallelActionRecognizer:
+class ActionRecognizer:
     def __init__(self,
                  model_path: str,
                  resolution: Tuple[int, int] = (256, 256),
@@ -615,7 +614,7 @@ def main():
     output_dir = "Monday Ontarget Actions Frames"
     collages_dir = "Monday A3 Ontarget Actions Collages"
 
-    recognizer = ParallelActionRecognizer(
+    recognizer = ActionRecognizer(
         model_path="model_a3_operations_using_fp16_with_8_frames_at_single_batch_from_98.40%_model_at_training_split_75.0_25.0.tflite",
         resolution=(256, 256),
         frames_per_window=8,
